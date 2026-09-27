@@ -214,6 +214,47 @@
       </div>
 
       <!-- 右侧：记录 + 成员 -->
+      <div class="panel panel-side panel-groups">
+        <div class="panel-title">
+          🧩 分组讨论
+          <button class="btn btn-primary btn-mini host-only group-create-toggle" id="btn-group-new"
+                  type="button" title="从当前成员中选人并设置同组/分开约束，服务端求解分组">＋ 生成分组</button>
+        </div>
+
+        <!-- 主持人：选择成员、组数与约束 -->
+        <form class="group-create host-only is-hidden" id="group-create-form">
+          <div class="group-form-row">
+            <label class="duration-picker" title="小组数（2～4，且不超过所选人数，各组人数之差不超过 1）">
+              分为
+              <select id="group-count"></select>
+              组
+            </label>
+            <span class="group-selected-count" id="group-selected-count">已选 0 人（需 2～12 人）</span>
+          </div>
+          <div class="group-members" id="group-members"></div>
+          <div class="group-form-hint" id="group-form-hint"></div>
+          <div class="group-constraint-editor">
+            <div class="group-constraint-row">
+              <select id="group-ca"></select>
+              <select id="group-ctype">
+                <option value="together">必须同组</option>
+                <option value="apart">必须分开</option>
+              </select>
+              <select id="group-cb"></select>
+              <button class="btn btn-secondary btn-mini" id="btn-group-add-constraint" type="button">添加约束</button>
+            </div>
+            <div class="group-constraint-chips" id="group-constraint-chips"></div>
+          </div>
+          <div class="group-form-actions">
+            <button class="btn btn-primary btn-mini" type="submit">生成方案</button>
+            <button class="btn btn-ghost btn-mini" id="btn-group-cancel-form" type="button">取消</button>
+          </div>
+        </form>
+
+        <!-- 当前分组方案 / 空状态 -->
+        <div class="group-result" id="group-result"></div>
+      </div>
+
       <div class="panel panel-side panel-logs">
         <div class="panel-title">
           操作记录

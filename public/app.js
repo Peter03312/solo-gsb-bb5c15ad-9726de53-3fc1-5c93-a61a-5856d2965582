@@ -26,7 +26,11 @@ const state = {
   // 当前打开延期申请表单的行动项 id（同一时刻只展开一个）
   taskReqFormId: null,
   // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
-  undoSeen: null
+  undoSeen: null,
+  // 分组讨论：生成分组表单是否展开；已展示过的方案 id（用于生成成功提示）
+  groupFormOpen: false,
+  groupSeenId: null,
+  groupExpect: false
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -103,6 +107,20 @@ const els = {
   btnTaskFormCancel: $('#btn-task-cancel-form'),
   taskCount: $('#task-count'),
   taskGroups: $('#task-groups'),
+  // 分组讨论
+  btnGroupNew: $('#btn-group-new'),
+  groupForm: $('#group-create-form'),
+  groupCount: $('#group-count'),
+  groupMembers: $('#group-members'),
+  groupSelectedCount: $('#group-selected-count'),
+  groupFormHint: $('#group-form-hint'),
+  groupCa: $('#group-ca'),
+  groupCb: $('#group-cb'),
+  groupCtype: $('#group-ctype'),
+  btnGroupAddConstraint: $('#btn-group-add-constraint'),
+  groupConstraintChips: $('#group-constraint-chips'),
+  btnGroupFormCancel: $('#btn-group-cancel-form'),
+  groupResult: $('#group-result'),
   toast: $('#toast-container')
 };
 
@@ -287,6 +305,9 @@ function enterRoom(creds) {
   state.taskStatus = new Map();
   state.taskReqFormId = null;
   state.undoSeen = null;
+  state.groupFormOpen = false;
+  state.groupSeenId = null;
+  state.groupExpect = false;
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -392,6 +413,8 @@ function handleMessage(msg) {
       state.taskSeeded = false;
       state.taskStatus = new Map();
       state.undoSeen = null;
+      state.groupSeenId = null;
+      state.groupExpect = false;
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -410,6 +433,12 @@ function handleMessage(msg) {
       applySnapshot(msg.snapshot);
       break;
     case 'error':
+      // 分组生成失败（无解/成员已离开/参数非法/过期）：清除等待标记，保留表单与上次方案
+      if (msg.code === 'GROUP_NO_SOLUTION' || msg.code === 'GROUP_BAD_MEMBERS' ||
+          msg.code === 'GROUP_BAD_COUNT' || msg.code === 'GROUP_BAD_CONSTRAINT' ||
+          msg.code === 'GROUP_MEMBER_LEFT' || msg.code === 'STALE_VERSION') {
+        state.groupExpect = false;
+      }
       if (msg.code === 'STALE_VERSION') {
         toast(`状态已过期，已同步到最新版本`, 'error');
       } else if (msg.code === 'NO_ROOM') {
@@ -441,6 +470,7 @@ function applySnapshot(snap) {
   processSwaps(snap);
   processUndo(snap);
   processTasks(snap);
+  processGroups(snap);
   render();
 }
 
@@ -563,6 +593,7 @@ function render() {
   renderSwapBar(snap);
   renderTopic(snap);
   renderTasks(snap);
+  renderGroups(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -1482,6 +1513,350 @@ els.taskGroups.addEventListener('submit', (e) => {
   if (!Number.isFinite(deadline)) return toast('请选择有效的新截止时间', 'error');
   if (!reason) return toast('请填写延期理由', 'error');
   sendCmd({ type: 'task_deadline_request', taskId, deadline, reason });
+});
+
+// ---------------------------------------------------------------------------
+// 分组讨论：主持人选人/组数/约束生成，全员展示当前方案（保留生成时昵称）
+// ---------------------------------------------------------------------------
+
+const GROUP_MIN_MEMBERS = 2;
+const GROUP_MAX_MEMBERS = 12;
+const GROUP_MIN_COUNT = 2;
+const GROUP_MAX_COUNT = 4;
+
+const GROUP_TYPE_TEXT = { together: '必须同组', apart: '必须分开' };
+
+// 生成分组表单草稿：{ memberIds:Set, count:number, constraints:[{a,b,type}] }
+let groupDraft = null;
+
+/** 检测新生成的方案：生成命令成功后由快照广播触发成功提示并收起表单 */
+function processGroups(snap) {
+  const plan = snap.groupPlan || null;
+  if (state.groupSeenId === null) {
+    // 首次快照（含重连）只播种，不提示
+    state.groupSeenId = plan ? plan.id : null;
+    return;
+  }
+  const currentId = plan ? plan.id : null;
+  if (currentId !== state.groupSeenId) {
+    if (state.groupExpect) {
+      toast('分组方案已生成', 'success');
+      closeGroupForm();
+    }
+    state.groupExpect = false;
+    state.groupSeenId = currentId;
+  }
+}
+
+function renderGroups(snap) {
+  els.btnGroupNew.classList.toggle('hidden', state.groupFormOpen);
+  els.groupForm.classList.toggle('is-hidden', !state.groupFormOpen);
+  if (state.groupFormOpen) renderGroupForm(snap);
+  renderGroupResult(snap);
+}
+
+function closeGroupForm() {
+  state.groupFormOpen = false;
+  groupDraft = null;
+  els.groupFormHint.textContent = '';
+}
+
+/** 打开表单：优先沿用上一方案的成员与约束（过滤已离开者），否则空草稿 */
+function openGroupForm(snap) {
+  const draft = { memberIds: new Set(), count: GROUP_MIN_COUNT, constraints: [] };
+  const plan = snap.groupPlan;
+  if (plan) {
+    const presentIds = new Set(snap.participants.map((p) => p.id));
+    const kept = [];
+    const dropped = [];
+    for (const m of plan.members) {
+      if (presentIds.has(m.id)) {
+        draft.memberIds.add(m.id);
+        kept.push(m);
+      } else {
+        dropped.push(m.nick);
+      }
+    }
+    draft.count = plan.groupCount;
+    for (const c of plan.constraints) {
+      if (presentIds.has(c.a) && presentIds.has(c.b)) {
+        draft.constraints.push({ a: c.a, b: c.b, type: c.type });
+      }
+    }
+    if (dropped.length > 0) {
+      setTimeout(() => toast(`原方案中「${dropped.join('、')}」已离开，已从名单移除`, 'info'), 0);
+    }
+    if (kept.length > 0) {
+      setTimeout(() => toast(`已沿用上次方案的 ${kept.length} 名成员与 ${draft.constraints.length} 条约束`, 'info'), 0);
+    }
+  }
+  groupDraft = draft;
+  state.groupFormOpen = true;
+  renderGroups(snap);
+}
+
+function sortedParticipants(snap) {
+  return snap.participants.slice().sort((a, b) => {
+    if (a.id === snap.hostId) return -1;
+    if (b.id === snap.hostId) return 1;
+    return a.joinedAt - b.joinedAt;
+  });
+}
+
+/** 生成表单：成员多选、组数、约束编辑（每次快照到达时重建，勾选状态取自草稿） */
+function renderGroupForm(snap) {
+  if (!groupDraft) groupDraft = { memberIds: new Set(), count: GROUP_MIN_COUNT, constraints: [] };
+
+  // 快照推进后，草稿中已离开房间的成员自动移除并提示
+  const presentIds = new Set(snap.participants.map((p) => p.id));
+  for (const id of [...groupDraft.memberIds]) {
+    if (!presentIds.has(id)) groupDraft.memberIds.delete(id);
+  }
+  groupDraft.constraints = groupDraft.constraints.filter(
+    (c) => groupDraft.memberIds.has(c.a) && groupDraft.memberIds.has(c.b)
+  );
+
+  // 成员多选
+  els.groupMembers.textContent = '';
+  for (const p of sortedParticipants(snap)) {
+    const label = document.createElement('label');
+    label.className = 'group-member' + (p.id === snap.hostId ? ' is-crown' : '');
+    label.dataset.id = p.id;
+    const checked = groupDraft.memberIds.has(p.id);
+    label.innerHTML = `
+      <input type="checkbox" data-group-member="${p.id}" ${checked ? 'checked' : ''} />
+      <span>${p.id === snap.hostId ? '👑 ' : ''}${escapeHtml(p.nick)}</span>
+      ${p.online ? '' : '<span class="offline-tag">离线</span>'}
+    `;
+    els.groupMembers.appendChild(label);
+  }
+
+  const n = groupDraft.memberIds.size;
+  els.groupSelectedCount.textContent = `已选 ${n} 人（需 ${GROUP_MIN_MEMBERS}～${GROUP_MAX_MEMBERS} 人）`;
+  els.groupSelectedCount.classList.toggle('ok', n >= GROUP_MIN_MEMBERS && n <= GROUP_MAX_MEMBERS);
+
+  // 组数：2～min(4, 人数)；人数不足 2 时禁用并给占位提示
+  const maxCount = Math.max(0, Math.min(GROUP_MAX_COUNT, n));
+  const prevCount = groupDraft.count;
+  els.groupCount.textContent = '';
+  if (maxCount < GROUP_MIN_COUNT) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = n === 0 ? '请先选择成员' : `至少选择 ${GROUP_MIN_COUNT} 人`;
+    opt.disabled = true;
+    els.groupCount.appendChild(opt);
+    groupDraft.count = prevCount; // 恢复选满后由下方逻辑重新钳制
+  } else {
+    for (let k = GROUP_MIN_COUNT; k <= GROUP_MAX_COUNT; k++) {
+      const opt = document.createElement('option');
+      opt.value = String(k);
+      opt.textContent = `${k} 组`;
+      opt.disabled = k > maxCount;
+      els.groupCount.appendChild(opt);
+    }
+    groupDraft.count = Math.min(Math.max(prevCount, GROUP_MIN_COUNT), maxCount);
+    els.groupCount.value = String(groupDraft.count);
+  }
+
+  syncGroupConstraintSelects(snap);
+  renderGroupChips(snap);
+  renderGroupFormHint();
+}
+
+function renderGroupFormHint() {
+  const n = groupDraft ? groupDraft.memberIds.size : 0;
+  if (n === 0) {
+    els.groupFormHint.textContent = '请从当前成员中选择 2～12 人';
+  } else if (n < GROUP_MIN_MEMBERS) {
+    els.groupFormHint.textContent = `至少还需选择 ${GROUP_MIN_MEMBERS - n} 人`;
+  } else if (n > GROUP_MAX_MEMBERS) {
+    els.groupFormHint.textContent = `最多选择 ${GROUP_MAX_MEMBERS} 人，请取消 ${n - GROUP_MAX_MEMBERS} 人`;
+  } else {
+    const k = groupDraft.count;
+    const base = Math.floor(n / k);
+    const big = n - base * k;
+    els.groupFormHint.textContent =
+      `将分为 ${k} 组：${big > 0 ? `${big} 组 ${base + 1} 人、${k - big} 组 ${base} 人` : `每组 ${base} 人`}，人数之差不超过 1`;
+  }
+}
+
+/** 约束两端的人员下拉框：只列出已选成员，保留当前选择 */
+function syncGroupConstraintSelects(snap) {
+  const fill = (sel, prefer) => {
+    const prev = prefer || sel.value;
+    sel.textContent = '';
+    const ids = [...groupDraft.memberIds];
+    for (const id of ids) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = nickOf(snap, id);
+      sel.appendChild(opt);
+    }
+    if (ids.includes(prev)) sel.value = prev;
+    else if (ids.length > 1) sel.value = ids[sel === els.groupCa ? 0 : 1] || ids[0];
+  };
+  fill(els.groupCa);
+  fill(els.groupCb);
+}
+
+function renderGroupChips(snap) {
+  els.groupConstraintChips.textContent = '';
+  for (let i = 0; i < groupDraft.constraints.length; i++) {
+    const c = groupDraft.constraints[i];
+    const chip = document.createElement('span');
+    chip.className = `group-chip ${c.type}`;
+    chip.innerHTML =
+      `<b>${escapeHtml(nickOf(snap, c.a))}</b>` +
+      `<span>${c.type === 'together' ? '⇄ 必须同组' : '⊘ 必须分开'}</span>` +
+      `<b>${escapeHtml(nickOf(snap, c.b))}</b>` +
+      `<button type="button" class="chip-x" data-group-remove-constraint="${i}" title="移除约束">✕</button>`;
+    els.groupConstraintChips.appendChild(chip);
+  }
+}
+
+/** 当前分组方案：全员可见；成员已离开按留存昵称展示并标注，不影响分组 */
+function renderGroupResult(snap) {
+  const plan = snap.groupPlan;
+  const box = els.groupResult;
+  box.textContent = '';
+  if (!plan) {
+    const empty = document.createElement('div');
+    empty.className = 'group-empty';
+    empty.textContent = '尚未生成分组讨论方案';
+    box.appendChild(empty);
+    return;
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'group-meta';
+  const sizes = plan.groups.map((g) => g.length).join(' / ');
+  const leftCount = plan.members.filter((m) => !m.present).length;
+  meta.innerHTML =
+    `<span>${plan.groupCount} 个小组 · 每组 ${sizes} 人 · 共 ${plan.members.length} 人</span>` +
+    `<span>生成于 ${formatTime(plan.createdAt)}</span>` +
+    (plan.constraints.length ? `<span>约束 ${plan.constraints.length} 条</span>` : '') +
+    (leftCount ? `<span class="offline-tag">${leftCount} 人已离开房间（不影响本方案）</span>` : '');
+  box.appendChild(meta);
+
+  if (plan.constraints.length) {
+    const summary = document.createElement('div');
+    summary.className = 'group-constraint-summary';
+    for (const c of plan.constraints) {
+      const chip = document.createElement('span');
+      chip.className = `group-chip ${c.type}`;
+      chip.innerHTML =
+        `<b>${escapeHtml(c.aNick)}</b><span>${c.type === 'together' ? '⇄ 同组' : '⊘ 分开'}</span><b>${escapeHtml(c.bNick)}</b>`;
+      summary.appendChild(chip);
+    }
+    box.appendChild(summary);
+  }
+
+  const cards = document.createElement('div');
+  cards.className = 'group-cards';
+  plan.groups.forEach((members, i) => {
+    const card = document.createElement('div');
+    card.className = 'group-card';
+    const rows = members
+      .map((m) => {
+        const isMe = state.me && m.id === state.me.id;
+        const tag = m.present
+          ? (isMe ? '<span class="me-tag">我</span>' : '')
+          : '<span class="offline-tag">已离开</span>';
+        return `<div class="group-member-row${isMe ? ' is-me' : ''}">
+          <span class="people-status ${m.present ? 'online' : 'offline'}"></span>
+          <span>${escapeHtml(m.nick)}</span>${tag}
+        </div>`;
+      })
+      .join('');
+    card.innerHTML = `
+      <div class="group-card-title">
+        <span>第 ${i + 1} 组</span>
+        <span class="group-card-size">${members.length} 人</span>
+      </div>
+      ${rows}
+    `;
+    cards.appendChild(card);
+  });
+  box.appendChild(cards);
+}
+
+els.btnGroupNew.addEventListener('click', () => {
+  if (!state.snapshot) return;
+  openGroupForm(state.snapshot);
+});
+
+els.btnGroupFormCancel.addEventListener('click', () => {
+  closeGroupForm();
+  renderGroups(state.snapshot);
+});
+
+// 勾选/取消成员：更新草稿、组数选项与约束下拉，不整表重建（保留滚动位置）
+els.groupMembers.addEventListener('change', (e) => {
+  const cb = e.target.closest('input[data-group-member]');
+  if (!cb || !groupDraft) return;
+  const id = cb.dataset.groupMember;
+  if (cb.checked) groupDraft.memberIds.add(id);
+  else groupDraft.memberIds.delete(id);
+  groupDraft.constraints = groupDraft.constraints.filter((c) => c.a !== id && c.b !== id);
+  renderGroupForm(state.snapshot);
+});
+
+// 添加一条约束（重复/两端相同拒绝）
+els.btnGroupAddConstraint.addEventListener('click', () => {
+  if (!groupDraft) return;
+  const a = els.groupCa.value;
+  const b = els.groupCb.value;
+  const type = els.groupCtype.value;
+  const snap = state.snapshot;
+  if (!a || !b) return toast('请先选择至少 2 名成员', 'error');
+  if (a === b) return toast('约束两端不能是同一成员', 'error');
+  const dup = groupDraft.constraints.some(
+    (c) => c.type === type && ((c.a === a && c.b === b) || (c.a === b && c.b === a))
+  );
+  if (dup) return toast('该约束已存在', 'error');
+  groupDraft.constraints.push({ a, b, type });
+  renderGroupChips(snap);
+});
+
+// 移除约束
+els.groupConstraintChips.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-group-remove-constraint]');
+  if (!btn) return;
+  const idx = Number(btn.dataset.groupRemoveConstraint);
+  groupDraft.constraints.splice(idx, 1);
+  renderGroupChips(state.snapshot);
+});
+
+// 组数变更
+els.groupCount.addEventListener('change', () => {
+  if (!groupDraft) return;
+  const k = parseInt(els.groupCount.value, 10);
+  if (Number.isInteger(k)) {
+    groupDraft.count = k;
+    renderGroupFormHint();
+  }
+});
+
+// 提交生成：服务端在无解时返回 GROUP_NO_SOLUTION 并保留上次方案，表单保持展开
+els.groupForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!groupDraft) return;
+  const memberIds = [...groupDraft.memberIds];
+  const n = memberIds.length;
+  if (n < GROUP_MIN_MEMBERS || n > GROUP_MAX_MEMBERS) {
+    return toast(`请选择 ${GROUP_MIN_MEMBERS}～${GROUP_MAX_MEMBERS} 名成员`, 'error');
+  }
+  const k = groupDraft.count;
+  if (!Number.isInteger(k) || k < GROUP_MIN_COUNT || k > GROUP_MAX_COUNT || k > n) {
+    return toast(`小组数须为 ${GROUP_MIN_COUNT}～${GROUP_MAX_COUNT} 且不超过所选人数`, 'error');
+  }
+  state.groupExpect = true;
+  sendCmd({
+    type: 'group_generate',
+    memberIds,
+    groupCount: k,
+    constraints: groupDraft.constraints
+  });
 });
 
 function renderLogs(snap) {

@@ -1875,6 +1875,201 @@ async function main() {
     await h.close(); await g1.close(); await g2.close();
   }
 
+  // 28. 分组讨论：选人/组数/约束生成，覆盖性、均衡性、无解保留上次方案、离开成员拒绝、断线重连
+  {
+    const createdG = await createRoom('分组主持');
+    const gh = await hostJoin(createdG);
+    const guestsG = [];
+    for (const name of ['成员甲', '成员乙', '成员丙', '成员丁', '成员戊', '成员己']) {
+      guestsG.push(await guestJoin(createdG.room, name));
+    }
+    await waitStable(gh, guestsG);
+    const gids = guestsG.map((g) => g.joined.you.id);
+    const gid = (i) => gids[i - 1];
+
+    function expectValidPlan(snap, ids, k, constraints) {
+      const plan = snap.groupPlan;
+      assert.ok(plan, '快照应包含分组方案');
+      assert.strictEqual(plan.groupCount, k);
+      assert.strictEqual(plan.members.length, ids.length, '方案成员数应等于所选人数');
+      const flat = plan.groups.map((g) => g.map((m) => m.id));
+      assert.strictEqual(flat.flat().length, ids.length, '每人恰好出现一次');
+      assert.strictEqual(new Set(flat.flat()).size, ids.length, '每人恰好出现一次（无重复）');
+      for (const id of ids) assert.ok(flat.flat().includes(id), '方案应覆盖所选成员 ' + id);
+      const sizes = flat.map((g) => g.length);
+      assert.strictEqual(sizes.length, k, '方案组数正确');
+      assert.ok(Math.max(...sizes) - Math.min(...sizes) <= 1, '各组人数之差不超过 1: ' + sizes);
+      const grpOf = new Map();
+      flat.forEach((g, gi) => g.forEach((id) => grpOf.set(id, gi)));
+      for (const c of constraints || []) {
+        const same = grpOf.get(c.a) === grpOf.get(c.b);
+        assert.ok(c.type === 'together' ? same : !same, '约束未满足: ' + c.type);
+      }
+      return plan;
+    }
+
+    // 28a. 6 人 2 组，无约束
+    await hostCmd(gh, { type: 'group_generate', memberIds: gids, groupCount: 2, constraints: [] });
+    let plan = expectValidPlan(gh.snapshot, gids, 2, []);
+    assert.strictEqual(plan.groups.map((g) => g.length).sort((a, b) => a - b).join(','), '3,3');
+    // 留存生成时昵称
+    assert.strictEqual(plan.members[0].nick, '成员甲');
+    // 参数随快照回显
+    assert.strictEqual(plan.constraints.length, 0);
+
+    // 普通参与者也应收到方案广播
+    await guestsG[0].waitFor((c) => c.snapshot.groupPlan && c.snapshot.groupPlan.id === plan.id);
+    assert.strictEqual(guestsG[0].snapshot.groupPlan.groups.length, 2);
+
+    // 28b. 同组约束按传递关系生效：1~2、2~3 必须同组 => 三人同组
+    await hostCmd(gh, {
+      type: 'group_generate', memberIds: gids, groupCount: 2,
+      constraints: [
+        { a: gid(1), b: gid(2), type: 'together' },
+        { a: gid(2), b: gid(3), type: 'together' }
+      ]
+    });
+    plan = expectValidPlan(gh.snapshot, gids, 2, [
+      { a: gid(1), b: gid(3), type: 'together' } // 传递闭包校验
+    ]);
+    let grp = new Map();
+    plan.groups.forEach((g, gi) => g.forEach((m) => grp.set(m.id, gi)));
+    assert.strictEqual(grp.get(gid(1)), grp.get(gid(2)));
+    assert.strictEqual(grp.get(gid(2)), grp.get(gid(3)));
+
+    // 28c. 必须分开：4 与 5 不同组（6 人 2 组时同组块 {1,2,3} 占满一组，4,5 自然在另一组，
+    //      改用 3 组验证）
+    await hostCmd(gh, {
+      type: 'group_generate', memberIds: gids, groupCount: 3,
+      constraints: [
+        { a: gid(1), b: gid(2), type: 'together' },
+        { a: gid(4), b: gid(5), type: 'apart' }
+      ]
+    });
+    plan = expectValidPlan(gh.snapshot, gids, 3, [
+      { a: gid(1), b: gid(2), type: 'together' },
+      { a: gid(4), b: gid(5), type: 'apart' }
+    ]);
+
+    // 28d. 直接矛盾：1~2 同组 + 1 与 2 分开 -> GROUP_NO_SOLUTION（direct_conflict），上次方案保留
+    const keepPlanId = plan.id;
+    gh.lastError = null;
+    await guestSend(gh, gh, {
+      type: 'group_generate', memberIds: gids, groupCount: 3,
+      constraints: [
+        { a: gid(1), b: gid(2), type: 'together' },
+        { a: gid(1), b: gid(2), type: 'apart' }
+      ]
+    });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_NO_SOLUTION');
+    assert.strictEqual(gh.snapshot.groupPlan.id, keepPlanId, '无解时必须保留上次方案');
+
+    // 28e. 结构性无解：2 人 2 组却要求同组（块规模 2 > 每组 1 人）-> GROUP_NO_SOLUTION
+    gh.lastError = null;
+    await guestSend(gh, gh, {
+      type: 'group_generate', memberIds: [gid(1), gid(2)], groupCount: 2,
+      constraints: [{ a: gid(1), b: gid(2), type: 'together' }]
+    });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_NO_SOLUTION');
+    assert.strictEqual(gh.snapshot.groupPlan.id, keepPlanId, '无解时必须保留上次方案');
+
+    // 28f. 有解必找到：5 人 2 组（3/2）+ 1~2 同组、4 apart 5
+    gh.lastError = null;
+    await hostCmd(gh, {
+      type: 'group_generate', memberIds: gids.slice(0, 5), groupCount: 2,
+      constraints: [
+        { a: gid(1), b: gid(2), type: 'together' },
+        { a: gid(4), b: gid(5), type: 'apart' }
+      ]
+    });
+    plan = expectValidPlan(gh.snapshot, gids.slice(0, 5), 2, [
+      { a: gid(4), b: gid(5), type: 'apart' }
+    ]);
+
+    // 28g. 参数非法：1 人 -> GROUP_BAD_MEMBERS（不改变版本）
+    gh.lastError = null;
+    const vBefore = gh.v;
+    await guestSend(gh, gh, { type: 'group_generate', memberIds: [gid(1)], groupCount: 2, constraints: [] });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_BAD_MEMBERS');
+    assert.strictEqual(gh.v, vBefore, '非法请求不改变版本');
+
+    // 28h. 组数超过人数 -> GROUP_BAD_COUNT
+    gh.lastError = null;
+    await guestSend(gh, gh, { type: 'group_generate', memberIds: [gid(1), gid(2)], groupCount: 3, constraints: [] });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_BAD_COUNT');
+
+    // 28i. 重复成员 -> GROUP_BAD_MEMBERS
+    gh.lastError = null;
+    await guestSend(gh, gh, {
+      type: 'group_generate', memberIds: [gid(1), gid(1), gid(2)], groupCount: 2, constraints: []
+    });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_BAD_MEMBERS');
+
+    // 28j. 约束引用名单外成员 -> GROUP_BAD_CONSTRAINT
+    gh.lastError = null;
+    await guestSend(gh, gh, {
+      type: 'group_generate', memberIds: gids.slice(0, 3), groupCount: 2,
+      constraints: [{ a: gid(1), b: gid(4), type: 'together' }]
+    });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_BAD_CONSTRAINT');
+
+    // 28k. 非主持人不能生成
+    const oldErr = guestsG[0].lastError;
+    await guestSend(gh, guestsG[0], { type: 'group_generate', memberIds: gids, groupCount: 2, constraints: [] });
+    await guestsG[0].waitFor((c) => c.lastError && c.lastError !== oldErr && c.lastError.code === 'FORBIDDEN');
+
+    // 28l. 过期版本 -> STALE_VERSION 且附最新快照
+    gh.lastError = null;
+    gh.send({ type: 'group_generate', version: gh.v - 1, memberIds: gids, groupCount: 2, constraints: [] });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.ok(gh.lastError.snapshot, 'STALE_VERSION 应携带最新快照');
+
+    // 28m. 含已离开成员 -> GROUP_MEMBER_LEFT 并返回最新快照；上次方案保留
+    const leavingId = gid(6);
+    guestsG[5].send({ type: 'leave' });
+    await gh.waitFor((c) => !c.snapshot.participants.some((p) => p.id === leavingId));
+    gh.lastError = null;
+    await guestSend(gh, gh, {
+      type: 'group_generate', memberIds: gids, groupCount: 2, constraints: []
+    });
+    await gh.waitFor((c) => c.lastError && c.lastError.code === 'GROUP_MEMBER_LEFT');
+    assert.ok(gh.lastError.snapshot, 'GROUP_MEMBER_LEFT 应携带最新快照');
+
+    // 28n. 成员进出不自动重分：旧方案保留，已离开成员 present=false 且昵称留存
+    plan = gh.snapshot.groupPlan;
+    const leavingMember = plan.members.find((m) => m.id === leavingId);
+    if (leavingMember) {
+      assert.strictEqual(leavingMember.present, false, '已离开成员标注 present:false');
+      assert.strictEqual(leavingMember.nick, '成员己', '保留生成时昵称');
+    }
+    // 重新生成不含离开者的方案后，旧方案（含离开者）被替换
+    const gidsAlive = gids.slice(0, 5);
+    await hostCmd(gh, { type: 'group_generate', memberIds: gidsAlive, groupCount: 2, constraints: [] });
+    expectValidPlan(gh.snapshot, gidsAlive, 2, []);
+    assert.ok(!gh.snapshot.groupPlan.members.some((m) => m.id === leavingId), '新方案不包含离开者');
+
+    // 28o. 断线重连后凭快照恢复方案
+    const beforeReconnect = gh.snapshot.groupPlan.id;
+    // 参与者断线（保留席位）：先 await 关闭，再用原 id+secret 重连
+    const id0 = guestsG[0].joined.you.id;
+    const secret0 = guestsG[0].joined.you.secret;
+    await guestsG[0].close();
+    await gh.waitFor((c) => c.snapshot.participants.find((p) => p.id === id0 && !p.online));
+    const rejoined = new Client();
+    await rejoined.open();
+    rejoined.send({
+      type: 'join', room: createdG.room, nick: '成员甲',
+      participantId: id0, secret: secret0
+    });
+    await rejoined.waitFor((c) => c.joined);
+    assert.ok(rejoined.snapshot.groupPlan, '重连后应恢复分组方案');
+    assert.strictEqual(rejoined.snapshot.groupPlan.id, beforeReconnect);
+
+    await gh.close();
+    await rejoined.close();
+    for (const g of guestsG.slice(1, 5)) await g.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
