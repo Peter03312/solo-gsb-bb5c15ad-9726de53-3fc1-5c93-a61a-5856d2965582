@@ -37,6 +37,8 @@
  *   { type: "task_deadline_request", version, taskId, deadline, reason }  // 负责人：提交延期申请（待接受/处理中）
  *   { type: "task_deadline_approve", version, taskId }  // 主持人：批准延期（原子更新截止时间）
  *   { type: "task_deadline_reject",  version, taskId }  // 主持人：拒绝延期（保留理由）
+ *   { type: "groups_generate", version, memberIds:[pid...], groupCount, constraints:[{type, a, b}] }
+ *                        // 主持人：生成分组讨论方案；type=same|separate，same 按传递关系生效
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -113,6 +115,24 @@
  * 申请结构随快照每个行动项的 deadlineRequest 字段下发，含申请人、审批人
  * 及各自时间；操作记录（kind:'task'）写入完整申请/审批信息。
  * 行动项无定时任务，断线重连后凭快照完整恢复。
+ *
+ * 分组讨论：主持人从当前成员中选取 2～12 人（groups_generate.memberIds），
+ * 设置 2～4 个小组（groupCount，且不超过所选人数），并可对所选成员两两添加
+ * 「必须同组（same）/必须分开（separate）」约束。同组关系按传递闭包生效
+ * （A≈B、B≈C 则 A≈C）：服务端先用并查集合并全部 same 约束得到若干连通块，
+ * 任一 separate 约束落在同一连通块内即约束自相矛盾，直接判定无解。
+ * 随后用带对称剪枝的深度优先搜索，把各连通块（按规模降序）逐一放入各小组，
+ * 保证：覆盖全部所选成员且每人恰好出现一次、各小组人数之差不超过 1
+ * （大小只能是 ⌊n/k⌋ 或 ⌈n/k⌉）、满足全部 same（以连通块整体放置实现）与
+ * separate（分属不同小组）约束。存在可行方案时穷举搜索必能找到一个；
+ * 无解（约束矛盾或无法均衡放下）返回 GROUP_NO_SOLUTION，明确提示且
+ * 不改变版本、保留上次方案，绝不忽略约束凑结果。
+ * 方案（room.groups）随快照 groups 字段向全员展示，每个成员留存生成时
+ * 昵称（之后改名或离开房间，方案内昵称都不变，离开者标注 offline）。
+ * 成员进出不会自动重新分组，方案也不引用当前成员表之外的状态；
+ * 断线重连凭快照原样恢复。生成命令复用主持人权限与房间版本守卫，
+ * 请求过期（STALE_VERSION）或含已离开成员（GROUP_MEMBER_GONE，
+ * 附最新快照）一律拒绝。
  */
 
 'use strict';
@@ -161,6 +181,14 @@ const TASK_REASON_MAX = 300;
 const TASK_DEADLINE_GRACE_MS = 5 * 60 * 1000;
 // 行动项截止时间最远可设为 366 天后
 const TASK_MAX_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
+// 分组讨论：可选成员人数与小组数的上下限
+const GROUPS_MIN_MEMBERS = 2;
+const GROUPS_MAX_MEMBERS = 12;
+const GROUPS_MIN_COUNT = 2;
+const GROUPS_MAX_COUNT = 4;
+const GROUPS_CONSTRAINT_TYPES = ['same', 'separate'];
+// 单次分组请求最多可携带的约束条数（成员对上限为 C(12,2)=66，留足冗余）
+const GROUPS_MAX_CONSTRAINTS = 200;
 
 const app = express();
 const server = http.createServer(app);
@@ -237,6 +265,13 @@ app.use(express.static(path.join(__dirname, 'public')));
  *       decidedBy, decidedByNick, decidedAt         // 审批人与审批时间（待审批时为 null）
  *     }
  *   }>,
+ *   groups: null | {        // 最近一次分组讨论方案（null 表示尚未生成；成员进出不自动重分）
+ *     id,                   // 方案唯一标识
+ *     createdAt, createdBy, createdByNick,
+ *     groupCount,           // 小组数（2～4）
+ *     groups: [[{ id, nick }]],   // 各小组成员（nick 为生成时昵称，成员离开后保持不变）
+ *     constraints: [{ type, a: {id, nick}, b: {id, nick} }]  // 生成时使用的约束（留存昵称）
+ *   },
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
  * }
@@ -261,6 +296,7 @@ function newRoom(code) {
     topic: null,
     topicHistory: [],
     tasks: new Map(),
+    groups: null,
     logs: [],
     createdAt: Date.now(),
     lastSeen: Date.now()
@@ -810,6 +846,175 @@ function buildTaskView(room, task) {
 }
 
 // ---------------------------------------------------------------------------
+// 分组讨论：并查集聚合同组约束 + 带对称剪枝的穷举搜索（有解必达）
+// ---------------------------------------------------------------------------
+
+/** 极简并查集：把「必须同组」关系按传递闭包合并为连通块 */
+function unionFind(n, indexOf) {
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (x) => {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
+  return { find, union, indexOf };
+}
+
+/**
+ * 在给定成员与约束下求一个均衡分组方案。
+ *
+ * @param {string[]} members 所选成员 id（调用方已去重且全部在房间内）
+ * @param {number} groupCount 小组数 k（2～4 且不超过人数）
+ * @param {{type:'same'|'separate', a:string, b:string}[]} constraints 成员对约束
+ * @returns {string[][]|null} 每个小组的成员 id 数组（均衡且满足全部约束）；无解返回 null
+ *
+ * 思路：
+ * 1. 并查集合并全部 same 约束得到连通块——同一块必须整体放入同一小组，
+ *    这天然实现了同组关系的传递性。
+ * 2. 任一 separate 约束两端在同一连通块 -> 自相矛盾，直接无解。
+ * 3. 连通块按规模降序后逐一放入 k 个小组（DFS）：
+ *    - 超容量（>⌈n/k⌉）或与组内成员存在 separate 冲突则剪枝；
+ *    - 对称剪枝：小组只能按顺序启用——放入空组时，若前面还有空组则跳过，
+ *      避免枚举出仅小组编号不同的同构方案。
+ * 4. 叶子处再核对各组人数多重集必须恰为均衡值（⌊n/k⌋ 与 ⌈n/k⌉ 的应得数量），
+ *    保证「各组人数之差不超过 1」。
+ * 所选人数 ≤ 12、组数 ≤ 4，搜索空间很小；穷举保证存在可行方案时必找到一个。
+ */
+function solveGrouping(members, groupCount, constraints) {
+  const n = members.length;
+  const indexOf = new Map(members.map((id, i) => [id, i]));
+  const uf = unionFind(n, indexOf);
+
+  for (const c of constraints) {
+    if (c.type === 'same') uf.union(indexOf.get(c.a), indexOf.get(c.b));
+  }
+
+  // separate 冲突：根相同 -> 与同组传递关系矛盾
+  const conflictRoots = new Set(); // "ra rb"（ra < rb）：两个连通块必须分开
+  for (const c of constraints) {
+    if (c.type !== 'separate') continue;
+    const ra = uf.find(indexOf.get(c.a));
+    const rb = uf.find(indexOf.get(c.b));
+    if (ra === rb) return null;
+    conflictRoots.add(ra < rb ? `${ra} ${rb}` : `${rb} ${ra}`);
+  }
+
+  // 收集连通块
+  const rootToBlock = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = uf.find(i);
+    if (!rootToBlock.has(r)) rootToBlock.set(r, []);
+    rootToBlock.get(r).push(i);
+  }
+  const blocks = [...rootToBlock.values()];
+  // 大块先放，尽早触发容量/冲突剪枝
+  blocks.sort((x, y) => y.length - x.length);
+  for (const b of blocks) {
+    if (b.length > Math.ceil(n / groupCount)) return null; // 单块超组容量上限
+  }
+
+  // 每个连通块内涉及的「必须分开」对方块集合
+  const blockRoots = blocks.map((b) => uf.find(b[0]));
+  const blockConflicts = blockRoots.map((r) => {
+    const others = new Set();
+    for (const key of conflictRoots) {
+      const [x, y] = key.split(' ').map(Number);
+      if (x === r) others.add(y);
+      else if (y === r) others.add(x);
+    }
+    return others;
+  });
+
+  const baseSize = Math.floor(n / groupCount);
+  const bigCount = n - baseSize * groupCount; // 大小为 ⌈n/k⌉ 的小组应有数量
+  const wantSizes = new Map();
+  wantSizes.set(baseSize + 1, bigCount);
+  wantSizes.set(baseSize, groupCount - bigCount);
+
+  const binSizes = new Array(groupCount).fill(0);
+  const binRoots = Array.from({ length: groupCount }, () => new Set());
+  const assignment = new Array(blocks.length).fill(-1);
+
+  const dfs = (bi) => {
+    if (bi === blocks.length) {
+      const got = new Map();
+      for (const s of binSizes) got.set(s, (got.get(s) || 0) + 1);
+      for (const [s, cnt] of wantSizes) {
+        if (cnt > 0 && got.get(s) !== cnt) return false;
+      }
+      return true;
+    }
+    const size = blocks[bi].length;
+    const root = blockRoots[bi];
+    const conflicts = blockConflicts[bi];
+    for (let bin = 0; bin < groupCount; bin++) {
+      if (binSizes[bin] + size > baseSize + 1) continue; // 超均衡容量
+      let clash = false;
+      for (const cr of conflicts) {
+        if (binRoots[bin].has(cr)) { clash = true; break; }
+      }
+      if (clash) continue;
+      if (binSizes[bin] === 0) {
+        // 对称剪枝：小组按顺序启用，前面尚有空组时不跳过空组编号
+        for (let earlier = 0; earlier < bin; earlier++) {
+          if (binSizes[earlier] === 0) { clash = true; break; }
+        }
+        if (clash) continue;
+      }
+      binSizes[bin] += size;
+      binRoots[bin].add(root);
+      assignment[bi] = bin;
+      if (dfs(bi + 1)) return true;
+      binSizes[bin] -= size;
+      binRoots[bin].delete(root);
+      assignment[bi] = -1;
+    }
+    return false;
+  };
+
+  if (!dfs(0)) return null;
+
+  // 按成员在输入中的顺序还原每个小组，输出确定且可读
+  const result = Array.from({ length: groupCount }, () => []);
+  blocks.forEach((block, bi) => {
+    const bin = assignment[bi];
+    for (const idx of block) result[bin].push(members[idx]);
+  });
+  for (const g of result) {
+    g.sort((a, b) => indexOf.get(a) - indexOf.get(b));
+  }
+  return result;
+}
+
+/** 分组讨论方案快照视图：方案自存生成时昵称，离开者额外标注 offline 供前端置灰 */
+function buildGroupsView(room) {
+  const plan = room.groups;
+  if (!plan) return null;
+  return {
+    id: plan.id,
+    createdAt: plan.createdAt,
+    createdBy: plan.createdBy,
+    createdByNick: plan.createdByNick,
+    groupCount: plan.groupCount,
+    groups: plan.groups.map((g) =>
+      g.map((m) => ({ id: m.id, nick: m.nick, online: !!room.participants.get(m.id) }))
+    ),
+    constraints: plan.constraints.map((c) => ({
+      type: c.type,
+      a: { id: c.a.id, nick: c.a.nick, online: !!room.participants.get(c.a.id) },
+      b: { id: c.b.id, nick: c.b.nick, online: !!room.participants.get(c.b.id) }
+    }))
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -823,6 +1028,7 @@ const UNDO_REASON_TEXT = {
   topic_changed: '议题投票状态出现新的变更',
   quota_changed: '发言配额周期出现新的变更',
   task_changed: '行动项状态出现新的变更',
+  groups_changed: '分组讨论方案出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -1009,6 +1215,7 @@ function buildSnapshot(room) {
     undo: buildUndoSnapshot(room),
     topic: buildTopicView(room.topic),
     tasks: [...room.tasks.values()].map((t) => buildTaskView(room, t)),
+    groups: buildGroupsView(room),
     topicHistory: room.topicHistory.map((t) => ({
       id: t.id,
       title: t.title,
@@ -1155,6 +1362,7 @@ wss.on('connection', (ws) => {
         case 'task_deadline_request':
         case 'task_deadline_approve':
         case 'task_deadline_reject':
+        case 'groups_generate':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -2068,6 +2276,126 @@ function handleCommand(ws, msg, room, pid, isHost) {
         );
       }
       return commit(room, { undoReason: 'task_changed' });
+    }
+
+    case 'groups_generate': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+
+      // ---- 成员名单：须为去重后的当前房间成员，人数 2～12 ----
+      if (!Array.isArray(msg.memberIds)) {
+        return sendError(ws, 'memberIds 必须是数组', 'BAD_GROUP_REQUEST', room);
+      }
+      const memberIds = msg.memberIds.map((x) => String(x || ''));
+      const memberSet = new Set();
+      for (const id of memberIds) {
+        if (!id) return sendError(ws, '成员 id 无效', 'BAD_GROUP_REQUEST', room);
+        if (memberSet.has(id)) return sendError(ws, '所选成员存在重复', 'GROUP_DUPLICATE_MEMBER', room);
+        memberSet.add(id);
+      }
+      const chosen = memberIds.map((id) => room.participants.get(id));
+      if (chosen.some((p) => !p)) {
+        // 含已离开成员：拒绝并返回最新快照，由主持人按最新成员表重新选择
+        return sendError(
+          ws,
+          '所选成员中有人已离开房间，请按最新成员名单重新选择',
+          'GROUP_MEMBER_GONE',
+          room
+        );
+      }
+      if (memberIds.length < GROUPS_MIN_MEMBERS || memberIds.length > GROUPS_MAX_MEMBERS) {
+        return sendError(
+          ws,
+          `参与分组的人数须为 ${GROUPS_MIN_MEMBERS}～${GROUPS_MAX_MEMBERS} 人`,
+          'BAD_GROUP_SIZE',
+          room
+        );
+      }
+
+      // ---- 小组数：2～4 整数且不超过所选人数 ----
+      const groupCount = Number(msg.groupCount);
+      if (
+        !Number.isInteger(groupCount) ||
+        groupCount < GROUPS_MIN_COUNT ||
+        groupCount > GROUPS_MAX_COUNT
+      ) {
+        return sendError(
+          ws,
+          `小组数须为 ${GROUPS_MIN_COUNT}～${GROUPS_MAX_COUNT} 的整数`,
+          'BAD_GROUP_COUNT',
+          room
+        );
+      }
+      if (groupCount > memberIds.length) {
+        return sendError(ws, '小组数不能超过参与分组的人数', 'BAD_GROUP_COUNT', room);
+      }
+
+      // ---- 约束：成员对数组，去重，全部端点须在所选名单内且不能成对自己 ----
+      const rawConstraints = Array.isArray(msg.constraints) ? msg.constraints : [];
+      if (rawConstraints.length > GROUPS_MAX_CONSTRAINTS) {
+        return sendError(ws, '约束数量超出上限', 'BAD_GROUP_REQUEST', room);
+      }
+      const constraintKeys = new Set();
+      const constraints = [];
+      for (const c of rawConstraints) {
+        if (!c || typeof c !== 'object') {
+          return sendError(ws, '约束格式无效', 'BAD_GROUP_REQUEST', room);
+        }
+        const type = String(c.type || '');
+        if (!GROUPS_CONSTRAINT_TYPES.includes(type)) {
+          return sendError(ws, '约束类型无效（same / separate）', 'BAD_GROUP_REQUEST', room);
+        }
+        const a = String(c.a || '');
+        const b = String(c.b || '');
+        if (!memberSet.has(a) || !memberSet.has(b)) {
+          return sendError(ws, '约束成员必须在所选名单内', 'BAD_GROUP_REQUEST', room);
+        }
+        if (a === b) {
+          return sendError(ws, '不能对同一名成员添加约束', 'BAD_GROUP_REQUEST', room);
+        }
+        // 同类约束按无序对去重；同一对若同时要求同组与分开则自相矛盾，留给求解判定无解
+        const pair = a < b ? `${a}|${b}` : `${b}|${a}`;
+        const key = `${type}:${pair}`;
+        if (constraintKeys.has(key)) continue;
+        constraintKeys.add(key);
+        constraints.push({ type, a, b });
+      }
+
+      // ---- 服务端求解：有解必达；无解明确提示，保留上次方案且不改变版本 ----
+      const solved = solveGrouping(memberIds, groupCount, constraints);
+      if (!solved) {
+        return sendError(
+          ws,
+          '在当前约束下没有可行分组：请检查「必须同组 / 必须分开」是否冲突，或调整小组数后重试（上次方案保留不变）',
+          'GROUP_NO_SOLUTION',
+          room
+        );
+      }
+
+      // 留存生成时昵称：成员之后改名 / 离开房间，方案内昵称保持不变
+      const nickOfAt = (id) => room.participants.get(id).nick;
+      room.groups = {
+        id: genId('gp_'),
+        createdAt: Date.now(),
+        createdBy: pid,
+        createdByNick: me.nick,
+        groupCount,
+        groups: solved.map((g) => g.map((id) => ({ id, nick: nickOfAt(id) }))),
+        constraints: constraints.map((c) => ({
+          type: c.type,
+          a: { id: c.a, nick: nickOfAt(c.a) },
+          b: { id: c.b, nick: nickOfAt(c.b) }
+        }))
+      };
+      const sameN = constraints.filter((c) => c.type === 'same').length;
+      const sepN = constraints.length - sameN;
+      const sizesText = solved.map((g) => g.length).join(' / ');
+      addLog(
+        room,
+        'groups',
+        `主持人生成分组讨论方案：${memberIds.length} 人分为 ${groupCount} 组` +
+          `（各组 ${sizesText} 人），必须同组 ${sameN} 对 · 必须分开 ${sepN} 对`
+      );
+      return commit(room, { undoReason: 'groups_changed' });
     }
   }
 }

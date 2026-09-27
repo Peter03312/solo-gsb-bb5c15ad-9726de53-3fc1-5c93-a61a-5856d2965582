@@ -26,7 +26,12 @@ const state = {
   // 当前打开延期申请表单的行动项 id（同一时刻只展开一个）
   taskReqFormId: null,
   // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
-  undoSeen: null
+  undoSeen: null,
+  // 分组讨论表单：本地草稿（不随快照重置）。selected 为成员 id 集合；
+  // constraints 为 {id,type,a,b} 草稿约束；groupsSeen 用于检测新方案并弹提示
+  groupsDraft: { selected: [], constraints: [] },
+  groupsSeeded: false,
+  groupsSeenId: null
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -103,6 +108,24 @@ const els = {
   btnTaskFormCancel: $('#btn-task-cancel-form'),
   taskCount: $('#task-count'),
   taskGroups: $('#task-groups'),
+  // 分组讨论
+  btnGroupsNew: $('#btn-groups-new'),
+  groupsForm: $('#groups-form'),
+  groupsCount: $('#groups-count'),
+  groupsSelectedCount: $('#groups-selected-count'),
+  btnGroupsSelectAll: $('#btn-groups-select-all'),
+  btnGroupsClearSel: $('#btn-groups-clear-sel'),
+  groupsMemberPick: $('#groups-member-pick'),
+  groupsPairA: $('#groups-pair-a'),
+  groupsPairRel: $('#groups-pair-rel'),
+  groupsPairB: $('#groups-pair-b'),
+  btnGroupsAddConstraint: $('#btn-groups-add-constraint'),
+  groupsConstraintList: $('#groups-constraint-list'),
+  btnGroupsGenerate: $('#btn-groups-generate'),
+  btnGroupsFormCancel: $('#btn-groups-form-cancel'),
+  groupsFormHint: $('#groups-form-hint'),
+  groupsMeta: $('#groups-meta'),
+  groupsResult: $('#groups-result'),
   toast: $('#toast-container')
 };
 
@@ -287,6 +310,9 @@ function enterRoom(creds) {
   state.taskStatus = new Map();
   state.taskReqFormId = null;
   state.undoSeen = null;
+  state.groupsDraft = { selected: [], constraints: [] };
+  state.groupsSeeded = false;
+  state.groupsSeenId = null;
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -392,6 +418,7 @@ function handleMessage(msg) {
       state.taskSeeded = false;
       state.taskStatus = new Map();
       state.undoSeen = null;
+      state.groupsSeeded = false;
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -441,6 +468,7 @@ function applySnapshot(snap) {
   processSwaps(snap);
   processUndo(snap);
   processTasks(snap);
+  processGroups(snap);
   render();
 }
 
@@ -563,6 +591,7 @@ function render() {
   renderSwapBar(snap);
   renderTopic(snap);
   renderTasks(snap);
+  renderGroups(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -1482,6 +1511,411 @@ els.taskGroups.addEventListener('submit', (e) => {
   if (!Number.isFinite(deadline)) return toast('请选择有效的新截止时间', 'error');
   if (!reason) return toast('请填写延期理由', 'error');
   sendCmd({ type: 'task_deadline_request', taskId, deadline, reason });
+});
+
+// ---------------------------------------------------------------------------
+// 分组讨论：主持人选成员 / 设约束 -> 服务端穷举求解；方案随快照向全员展示
+// ---------------------------------------------------------------------------
+
+const GROUPS_MIN_MEMBERS = 2;
+const GROUPS_MAX_MEMBERS = 12;
+const GROUPS_MIN_COUNT = 2;
+const GROUPS_MAX_COUNT = 4;
+const GROUP_CONSTRAINT_TEXT = { same: '必须同组', separate: '必须分开' };
+
+// 小组数选项 2～4
+for (let k = GROUPS_MIN_COUNT; k <= GROUPS_MAX_COUNT; k++) {
+  const opt = document.createElement('option');
+  opt.value = String(k);
+  opt.textContent = `${k} 个小组`;
+  els.groupsCount.appendChild(opt);
+}
+
+/** 方案变化反馈：新方案（含重连后首次见到）只在非播种阶段提示主持人/本人相关信息 */
+function processGroups(snap) {
+  const plan = snap.groups || null;
+  const id = plan ? plan.id : null;
+  if (!state.groupsSeeded) {
+    state.groupsSeeded = true;
+    state.groupsSeenId = id;
+    return;
+  }
+  if (id && id !== state.groupsSeenId) {
+    const sizes = plan.groups.map((g) => g.length).join(' / ');
+    toast(`已生成新的分组方案：${plan.groupCount} 组（各组 ${sizes} 人）`, 'success');
+  }
+  state.groupsSeenId = id;
+}
+
+/**
+ * 草稿修剪：成员离开后自动从勾选与约束中移除（过期请求会被服务端拒绝，
+ * 这里同步保持草稿与当前成员表一致）。
+ */
+function pruneGroupsDraft(snap) {
+  const d = state.groupsDraft;
+  const alive = new Set(snap.participants.map((p) => p.id));
+  const beforeSel = d.selected.length;
+  d.selected = d.selected.filter((id) => alive.has(id));
+  const beforeCs = d.constraints.length;
+  d.constraints = d.constraints.filter((c) => alive.has(c.a) && alive.has(c.b));
+  return beforeSel !== d.selected.length || beforeCs !== d.constraints.length;
+}
+
+/**
+ * 计算同组约束的传递闭包（并查集），返回：
+ *  compOf: 成员 id -> 连通块代表 id；
+ *  impliedSame: 由传递关系隐含（非显式添加）的同组成员对数量。
+ */
+function sameClosure(constraints) {
+  const parent = new Map();
+  const find = (x) => {
+    if (!parent.has(x)) parent.set(x, x);
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  for (const c of constraints) {
+    if (c.type === 'same') union(c.a, c.b);
+  }
+  const compOf = new Map();
+  for (const k of parent.keys()) compOf.set(k, find(k));
+  return compOf;
+}
+
+/** 渲染分组面板：方案展示（全员）+ 主持人表单草稿 */
+function renderGroups(snap) {
+  renderGroupsResult(snap);
+  if (state.me && state.me.host) {
+    pruneGroupsDraft(snap);
+    renderGroupsForm(snap);
+  }
+}
+
+/** 当前方案展示：留存生成时昵称；成员离开后置灰标注，但方案不自动重分 */
+function renderGroupsResult(snap) {
+  const box = els.groupsResult;
+  box.textContent = '';
+  const plan = snap.groups;
+  if (!plan) {
+    const empty = document.createElement('div');
+    empty.className = 'groups-empty';
+    empty.textContent = state.me && state.me.host
+      ? '尚未生成分组方案：点右上角「＋ 生成分组」，选取成员、小组数与约束后由服务端均衡分组'
+      : '主持人尚未生成分组方案';
+    box.appendChild(empty);
+    return;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'groups-result-head';
+  const total = plan.groups.reduce((n, g) => n + g.length, 0);
+  const sizes = plan.groups.map((g) => g.length);
+  const balanced = Math.max(...sizes) - Math.min(...sizes) <= 1;
+  const sameN = plan.constraints.filter((c) => c.type === 'same').length;
+  const sepN = plan.constraints.length - sameN;
+  head.innerHTML = `
+    <span>生成于 <b>${formatTime(plan.createdAt)}</b></span>
+    <span>${total} 人 · <b>${plan.groupCount}</b> 组 · 各组 ${sizes.join(' / ')} 人${balanced ? '（人数均衡）' : ''}</span>
+    <span>必须同组 ${sameN} 对 · 必须分开 ${sepN} 对</span>`;
+  box.appendChild(head);
+
+  const grid = document.createElement('div');
+  grid.className = 'groups-grid';
+  plan.groups.forEach((g, i) => {
+    const card = document.createElement('div');
+    card.className = 'group-card';
+    const ul = document.createElement('ul');
+    ul.className = 'group-members';
+    for (const m of g) {
+      const li = document.createElement('li');
+      li.className = 'group-member' + (m.online ? '' : ' is-gone');
+      li.innerHTML = `
+        <span class="gm-name">${escapeHtml(m.nick)}</span>
+        ${state.me && m.id === state.me.id ? '<span class="me-tag">我</span>' : ''}
+        ${m.online ? '' : '<span class="offline-tag">已离开</span>'}`;
+      ul.appendChild(li);
+    }
+    card.innerHTML = `<div class="group-card-title">第 ${i + 1} 组<span class="group-size">${g.length} 人</span></div>`;
+    card.appendChild(ul);
+    grid.appendChild(card);
+  });
+  box.appendChild(grid);
+
+  if (plan.constraints.length) {
+    const chips = document.createElement('div');
+    chips.className = 'groups-constraints-view';
+    for (const c of plan.constraints) {
+      const gone = !c.a.online || !c.b.online;
+      const chip = document.createElement('span');
+      chip.className = `gcv-chip ${c.type}${gone ? ' is-gone' : ''}`;
+      chip.textContent =
+        `${c.type === 'same' ? '同组' : '分开'}：${c.a.nick} ↔ ${c.b.nick}${gone ? '（含已离开成员）' : ''}`;
+      chips.appendChild(chip);
+    }
+    box.appendChild(chips);
+  }
+}
+
+/** 主持人表单：成员勾选、小组数、约束列表与提交校验提示 */
+function renderGroupsForm(snap) {
+  const d = state.groupsDraft;
+  const selectedSet = new Set(d.selected);
+
+  // 成员勾选列表（主持人在前，其余按加入时间）
+  const sorted = snap.participants.slice().sort((a, b) => {
+    if (a.id === snap.hostId) return -1;
+    if (b.id === snap.hostId) return 1;
+    return a.joinedAt - b.joinedAt;
+  });
+  els.groupsMemberPick.textContent = '';
+  for (const p of sorted) {
+    const li = document.createElement('li');
+    const picked = selectedSet.has(p.id);
+    // 达到 12 人上限后，未勾选项禁用（取消勾选不受影响）
+    const atCap = d.selected.length >= GROUPS_MAX_MEMBERS;
+    const disabled = atCap && !picked;
+    li.className = (picked ? 'is-picked ' : '') + (disabled ? 'is-disabled' : '');
+    li.innerHTML = `
+      <input type="checkbox" data-member-id="${p.id}" ${picked ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
+      <span class="gm-nick">${escapeHtml(p.nick)}${p.id === snap.hostId ? '（主持人）' : ''}</span>
+      ${p.online ? '' : '<span class="gm-offline">离线</span>'}`;
+    els.groupsMemberPick.appendChild(li);
+  }
+
+  // 已选人数与小组数可用性（组数超过人数时自动收敛到上限）
+  const n = d.selected.length;
+  const cnt = els.groupsSelectedCount;
+  cnt.textContent = `已选 ${n} 人（${GROUPS_MIN_MEMBERS}～${GROUPS_MAX_MEMBERS} 人）`;
+  cnt.classList.toggle('is-ok', n >= GROUPS_MIN_MEMBERS && n <= GROUPS_MAX_MEMBERS);
+  cnt.classList.toggle('is-bad', n > 0 && n < GROUPS_MIN_MEMBERS);
+  const prevK = parseInt(els.groupsCount.value, 10) || GROUPS_MIN_COUNT;
+  els.groupsCount.textContent = '';
+  for (let k = GROUPS_MIN_COUNT; k <= GROUPS_MAX_COUNT; k++) {
+    const opt = document.createElement('option');
+    opt.value = String(k);
+    opt.textContent = `${k} 个小组`;
+    els.groupsCount.appendChild(opt);
+  }
+  // 合法可选范围：2～4，且 k 不超过已选人数（人数为 0/1 时先保持 2，由红字提示）
+  const upperK = Math.min(GROUPS_MAX_COUNT, Math.max(n, GROUPS_MIN_COUNT));
+  els.groupsCount.value = String(Math.min(prevK, upperK));
+
+  // 约束两端下拉：仅含已选成员；两个下拉尽量默认选中不同成员
+  syncPairSelect(els.groupsPairA, snap, d);
+  syncPairSelect(els.groupsPairB, snap, d);
+  if (d.selected.length >= 2 && els.groupsPairA.value === els.groupsPairB.value) {
+    const other = d.selected.find((id) => id !== els.groupsPairA.value);
+    if (other) els.groupsPairB.value = other;
+  }
+
+  renderConstraintDrafts(snap);
+  renderGroupsFormHint(snap);
+}
+
+function syncPairSelect(sel, snap, d) {
+  const prev = sel.value;
+  sel.textContent = '';
+  const pmap = participantMap(snap);
+  for (const id of d.selected) {
+    const p = pmap.get(id);
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = p ? p.nick : '已离开';
+    sel.appendChild(opt);
+  }
+  if (prev && d.selected.includes(prev)) sel.value = prev;
+}
+
+/** 约束草稿列表：标注同组/分开，以及由传递关系隐含的同组提示 */
+function renderConstraintDrafts(snap) {
+  const d = state.groupsDraft;
+  const pmap = participantMap(snap);
+  const compOf = sameClosure(d.constraints);
+  const explicitSamePairs = new Set(
+    d.constraints.filter((c) => c.type === 'same').map((c) => [c.a, c.b].sort().join('|'))
+  );
+  els.groupsConstraintList.textContent = '';
+  for (const c of d.constraints) {
+    const li = document.createElement('li');
+    li.className = `groups-constraint-item gc-${c.type}`;
+    const aName = pmap.get(c.a)?.nick ?? '已离开';
+    const bName = pmap.get(c.b)?.nick ?? '已离开';
+    let implied = '';
+    if (c.type === 'same' && compOf) {
+      // 若该对所在连通块还有其他成员，提示传递效应
+      const mates = d.selected.filter(
+        (id) => id !== c.a && id !== c.b && compOf.get(id) === compOf.get(c.a)
+      );
+      if (mates.length) {
+        implied = `（传递：与 ${mates.map((id) => pmap.get(id)?.nick ?? '已离开').join('、')} 也同组）`;
+      }
+    }
+    li.innerHTML = `
+      <span class="gc-tag">${GROUP_CONSTRAINT_TEXT[c.type]}</span>
+      <span class="gc-pair">${escapeHtml(aName)} ↔ ${escapeHtml(bName)}</span>
+      <span class="gc-implied">${escapeHtml(implied)}</span>
+      <button class="gc-del" type="button" data-del-constraint="${c.id}" title="删除该约束">✕</button>`;
+    els.groupsConstraintList.appendChild(li);
+  }
+}
+
+/** 表单底部实时校验提示（含客户端可预判的矛盾：传递同组 vs 必须分开） */
+function renderGroupsFormHint(snap) {
+  const d = state.groupsDraft;
+  const n = d.selected.length;
+  const k = parseInt(els.groupsCount.value, 10) || 0;
+  const hint = els.groupsFormHint;
+  hint.classList.remove('is-bad');
+  if (n === 0) {
+    hint.textContent = '请先勾选参与分组的成员';
+    return;
+  }
+  if (n < GROUPS_MIN_MEMBERS) {
+    hint.textContent = `至少还需选择 ${GROUPS_MIN_MEMBERS - n} 人`;
+    hint.classList.add('is-bad');
+    return;
+  }
+  if (n > GROUPS_MAX_MEMBERS) {
+    hint.textContent = `最多选择 ${GROUPS_MAX_MEMBERS} 人`;
+    hint.classList.add('is-bad');
+    return;
+  }
+  if (k > n) {
+    hint.textContent = `小组数（${k}）不能超过人数（${n}）`;
+    hint.classList.add('is-bad');
+    return;
+  }
+  // 传递同组与「必须分开」直接矛盾的客户端预判
+  const compOf = sameClosure(d.constraints);
+  const clash = d.constraints.find(
+    (c) => c.type === 'separate' && compOf.get(c.a) === compOf.get(c.b)
+  );
+  if (clash) {
+    const pmap = participantMap(snap);
+    hint.textContent =
+      `约束冲突：「${pmap.get(clash.a)?.nick}」与「${pmap.get(clash.b)?.nick}」已通过同组关系连通，不能再要求分开`;
+    hint.classList.add('is-bad');
+    return;
+  }
+  hint.textContent = `将生成 ${k} 个小组，各组人数为 ${Math.floor(n / k)} 或 ${Math.ceil(n / k)} 人`;
+}
+
+// 主持人：打开 / 收起分组表单
+els.btnGroupsNew.addEventListener('click', () => {
+  els.groupsForm.classList.remove('is-hidden');
+});
+
+els.btnGroupsFormCancel.addEventListener('click', () => {
+  els.groupsForm.classList.add('is-hidden');
+});
+
+// 勾选成员（人数上限由 disabled 控制，这里再防御一次）
+els.groupsMemberPick.addEventListener('change', (e) => {
+  const input = e.target.closest('input[data-member-id]');
+  if (!input) return;
+  const snap = state.snapshot;
+  if (!snap) return;
+  const id = input.dataset.memberId;
+  const d = state.groupsDraft;
+  if (input.checked) {
+    if (!d.selected.includes(id)) {
+      if (d.selected.length >= GROUPS_MAX_MEMBERS) {
+        input.checked = false;
+        toast(`最多选择 ${GROUPS_MAX_MEMBERS} 人`, 'error');
+        return;
+      }
+      d.selected.push(id);
+    }
+  } else {
+    d.selected = d.selected.filter((x) => x !== id);
+    // 取消勾选时连带移除涉及该成员的约束
+    d.constraints = d.constraints.filter((c) => c.a !== id && c.b !== id);
+  }
+  renderGroupsForm(snap);
+});
+
+// 全选在场（含主持人；离线成员不可点，服务端仍接受，但默认只选在线者）
+els.btnGroupsSelectAll.addEventListener('click', () => {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const d = state.groupsDraft;
+  d.selected = snap.participants.filter((p) => p.online).slice(0, GROUPS_MAX_MEMBERS).map((p) => p.id);
+  d.constraints = d.constraints.filter((c) => d.selected.includes(c.a) && d.selected.includes(c.b));
+  if (snap.participants.filter((p) => p.online).length > GROUPS_MAX_MEMBERS) {
+    toast(`在线成员超过 ${GROUPS_MAX_MEMBERS} 人，已选择前 ${GROUPS_MAX_MEMBERS} 人`, 'info');
+  }
+  renderGroupsForm(snap);
+});
+
+els.btnGroupsClearSel.addEventListener('click', () => {
+  state.groupsDraft.selected = [];
+  state.groupsDraft.constraints = [];
+  renderGroupsForm(state.snapshot);
+});
+
+// 添加成员对约束（同一对同类约束去重）
+els.btnGroupsAddConstraint.addEventListener('click', () => {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const d = state.groupsDraft;
+  const a = els.groupsPairA.value;
+  const b = els.groupsPairB.value;
+  const type = els.groupsPairRel.value;
+  if (!a || !b) return toast('请选择约束涉及的两名成员', 'error');
+  if (a === b) return toast('不能对同一名成员添加约束', 'error');
+  const dup = d.constraints.some((c) => c.type === type &&
+    ((c.a === a && c.b === b) || (c.a === b && c.b === a)));
+  if (dup) return toast('该约束已存在', 'info');
+  d.constraints.push({ id: 'gc_' + Math.random().toString(36).slice(2, 9), type, a, b });
+  renderGroupsForm(snap);
+});
+
+// 删除约束
+els.groupsConstraintList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-del-constraint]');
+  if (!btn) return;
+  const id = btn.dataset.delConstraint;
+  state.groupsDraft.constraints = state.groupsDraft.constraints.filter((c) => c.id !== id);
+  renderGroupsForm(state.snapshot);
+});
+
+// 调整小组数时即时刷新均衡提示
+els.groupsCount.addEventListener('change', () => {
+  if (state.snapshot) renderGroupsFormHint(state.snapshot);
+});
+
+// 提交生成：复用主持人权限与版本守卫；无解时服务端保留上次方案并明确提示
+els.groupsForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const snap = state.snapshot;
+  if (!snap) return;
+  const d = state.groupsDraft;
+  const n = d.selected.length;
+  if (n < GROUPS_MIN_MEMBERS || n > GROUPS_MAX_MEMBERS) {
+    return toast(`参与分组的人数须为 ${GROUPS_MIN_MEMBERS}～${GROUPS_MAX_MEMBERS} 人`, 'error');
+  }
+  const groupCount = parseInt(els.groupsCount.value, 10);
+  if (!Number.isInteger(groupCount) || groupCount < GROUPS_MIN_COUNT || groupCount > GROUPS_MAX_COUNT) {
+    return toast(`小组数须为 ${GROUPS_MIN_COUNT}～${GROUPS_MAX_COUNT}`, 'error');
+  }
+  if (groupCount > n) return toast('小组数不能超过参与分组的人数', 'error');
+  const compOf = sameClosure(d.constraints);
+  const clash = d.constraints.find(
+    (c) => c.type === 'separate' && compOf.get(c.a) === compOf.get(c.b)
+  );
+  if (clash) return toast('存在自相矛盾的约束（同组传递与必须分开冲突），服务端也会拒绝', 'error');
+  const constraints = d.constraints.map((c) => ({ type: c.type, a: c.a, b: c.b }));
+  els.btnGroupsGenerate.disabled = true;
+  sendCmd({ type: 'groups_generate', memberIds: d.selected.slice(), groupCount, constraints });
+  // 快照到达（成功或错误回带快照）后恢复按钮
+  setTimeout(() => { els.btnGroupsGenerate.disabled = false; }, 600);
 });
 
 function renderLogs(snap) {

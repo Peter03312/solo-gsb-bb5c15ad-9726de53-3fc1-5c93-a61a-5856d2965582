@@ -213,9 +213,58 @@
         </div>
       </div>
 
-      <!-- 右侧：记录 + 成员 -->
-      <div class="panel panel-side panel-logs">
+      <!-- 分组讨论 -->
+      <div class="panel panel-groups">
         <div class="panel-title">
+          🧩 分组讨论
+          <span class="hint" id="groups-meta">主持人选取成员并设置约束，服务端均衡分组</span>
+          <button class="btn btn-primary btn-mini host-only groups-create-toggle" id="btn-groups-new"
+                  type="button" title="从当前成员中选取 2～12 人并设置同组/分开约束">＋ 生成分组</button>
+        </div>
+
+        <!-- 主持人：选择成员 / 小组数 / 约束 -->
+        <form class="groups-create host-only is-hidden" id="groups-form">
+          <div class="groups-form-head">
+            <label class="duration-picker" title="分成几个小组（2～4 个，且不超过所选人数）">
+              小组数
+              <select id="groups-count"></select>
+            </label>
+            <span class="groups-selected-count" id="groups-selected-count">已选 0 人（2～12 人）</span>
+            <button class="btn btn-ghost btn-mini" id="btn-groups-select-all" type="button">全选在场</button>
+            <button class="btn btn-ghost btn-mini" id="btn-groups-clear-sel" type="button">清空选择</button>
+          </div>
+          <ul class="groups-member-pick" id="groups-member-pick"></ul>
+
+          <div class="groups-constraint-area">
+            <div class="groups-constraint-head">
+              <span>成员对约束</span>
+              <span class="hint">同组关系按传递关系生效（A 同 B、B 同 C ⇒ A 同 C）</span>
+            </div>
+            <div class="groups-constraint-add">
+              <select id="groups-pair-a"></select>
+              <select id="groups-pair-rel">
+                <option value="same">必须同组</option>
+                <option value="separate">必须分开</option>
+              </select>
+              <select id="groups-pair-b"></select>
+              <button class="btn btn-secondary btn-mini" id="btn-groups-add-constraint" type="button">添加约束</button>
+            </div>
+            <ul class="groups-constraint-list" id="groups-constraint-list"></ul>
+          </div>
+
+          <div class="groups-form-actions">
+            <button class="btn btn-primary" id="btn-groups-generate" type="submit">✨ 生成均衡分组</button>
+            <button class="btn btn-ghost btn-mini" id="btn-groups-form-cancel" type="button">取消</button>
+            <span class="groups-form-hint" id="groups-form-hint"></span>
+          </div>
+        </form>
+
+        <!-- 当前方案：随快照向全员展示 -->
+        <div class="groups-result" id="groups-result"></div>
+      </div>
+
+      <!-- 右侧：记录 + 成员 -->
+      <div class="panel panel-side panel-logs">        <div class="panel-title">
           操作记录
           <button class="btn btn-mini btn-ghost host-only" id="btn-clear-logs" type="button">清空记录</button>
         </div>

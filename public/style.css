@@ -212,7 +212,7 @@ input[type="text"]:focus {
 .room-grid {
   display: grid;
   grid-template-columns: 1.35fr 1fr 1fr;
-  grid-template-rows: auto auto auto 1fr;
+  grid-template-rows: auto auto auto auto 1fr;
   gap: 18px;
   padding: 18px 22px 30px;
   max-width: 1600px;
@@ -235,8 +235,9 @@ input[type="text"]:focus {
 .panel-queue { grid-column: 2 / 4; grid-row: 1; }
 .panel-topic { grid-column: 1 / 4; grid-row: 2; }
 .panel-tasks { grid-column: 1 / 4; grid-row: 3; }
-.panel-logs  { grid-column: 1 / 3; grid-row: 4; }
-.panel-people { grid-column: 3; grid-row: 4; }
+.panel-groups { grid-column: 1 / 4; grid-row: 4; }
+.panel-logs  { grid-column: 1 / 3; grid-row: 5; }
+.panel-people { grid-column: 3; grid-row: 5; }
 
 .panel-title {
   font-size: 18px;
@@ -1352,6 +1353,299 @@ input[type="datetime-local"]:focus {
   font-size: 14px;
 }
 
+/* ===== 分组讨论 ===== */
+#btn-groups-new {
+  margin-left: auto;
+}
+
+.groups-create {
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(167, 139, 250, 0.55);
+  background: rgba(167, 139, 250, 0.07);
+  border-radius: 12px;
+  margin-bottom: 12px;
+}
+
+body.role-host .groups-create.host-only { display: flex; }
+.groups-create.is-hidden { display: none !important; }
+
+.groups-form-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.groups-selected-count {
+  font-size: 14px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.groups-selected-count.is-ok { color: #c4b5fd; font-weight: 600; }
+.groups-selected-count.is-bad { color: #fca5a5; }
+
+.groups-member-pick {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.groups-member-pick li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 15px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.groups-member-pick li.is-picked {
+  border-color: var(--accent);
+  background: rgba(167, 139, 250, 0.16);
+}
+
+.groups-member-pick li input { accent-color: var(--accent); cursor: pointer; }
+.groups-member-pick li.is-disabled { opacity: 0.45; cursor: not-allowed; }
+.groups-member-pick .gm-nick { flex: 1; word-break: break-all; }
+.groups-member-pick .gm-offline { font-size: 11px; color: var(--text-dim); }
+
+.groups-constraint-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px dashed rgba(167, 139, 250, 0.45);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.groups-constraint-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.groups-constraint-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.groups-constraint-add select {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  max-width: 180px;
+}
+
+.groups-constraint-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.groups-constraint-list:empty::after {
+  content: '暂未添加约束（可直接生成分组）';
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.groups-constraint-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.groups-constraint-item.gc-same { border-left: 3px solid var(--success); }
+.groups-constraint-item.gc-separate { border-left: 3px solid var(--warning); }
+
+.groups-constraint-item .gc-tag {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.gc-same .gc-tag { background: rgba(34, 197, 94, 0.2); color: #bbf7d0; }
+.gc-separate .gc-tag { background: rgba(245, 158, 11, 0.2); color: #fcd34d; }
+
+.groups-constraint-item .gc-pair { flex: 1; word-break: break-all; }
+.groups-constraint-item .gc-implied { color: var(--text-dim); font-size: 12px; }
+.groups-constraint-item .gc-del {
+  background: transparent;
+  border: none;
+  color: #fca5a5;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.groups-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.groups-form-hint { font-size: 13px; color: var(--text-dim); }
+.groups-form-hint.is-bad { color: #fca5a5; }
+
+.groups-result {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.groups-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 16px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 22px;
+}
+
+.groups-result-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.groups-result-head b { color: var(--text); }
+
+.groups-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.group-card {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 12px;
+  background: var(--panel-2);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: pop 0.2s ease;
+  min-width: 0;
+}
+
+.group-card:nth-child(4n+1) { border-left-color: var(--primary); }
+.group-card:nth-child(4n+2) { border-left-color: var(--success); }
+.group-card:nth-child(4n+3) { border-left-color: var(--warning); }
+.group-card:nth-child(4n+4) { border-left-color: var(--accent); }
+
+.group-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.group-card-title .group-size {
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bg);
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+
+.group-members {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.group-member {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.group-member.is-gone { opacity: 0.5; }
+.group-member .gm-name { flex: 1; word-break: break-all; }
+.group-member .me-tag {
+  font-size: 12px;
+  background: var(--success);
+  color: #052e16;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+}
+
+.groups-constraints-view {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.gcv-chip {
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.gcv-chip.same { color: #bbf7d0; border-color: rgba(34, 197, 94, 0.5); }
+.gcv-chip.separate { color: #fcd34d; border-color: rgba(245, 158, 11, 0.55); }
+.gcv-chip.is-gone { opacity: 0.55; text-decoration: line-through; }
+
+.log-item.kind-groups { color: #c4b5fd; }
+
 /* ===== 记录 / 成员 ===== */
 .log-list, .people-list {
   list-style: none;
@@ -1463,13 +1757,15 @@ body.role-participant #stage-actions-host { display: none; }
     grid-template-rows: none;
     height: auto;
   }
-  .panel-stage, .panel-queue, .panel-topic, .panel-tasks, .panel-logs, .panel-people {
+  .panel-stage, .panel-queue, .panel-topic, .panel-tasks, .panel-groups, .panel-logs, .panel-people {
     grid-column: 1;
     grid-row: auto;
   }
   .panel { min-height: 240px; }
   .panel-topic { min-height: 0; }
   .panel-tasks { min-height: 0; }
+  .panel-groups { min-height: 0; }
+  .groups-member-pick { grid-template-columns: 1fr 1fr; }
   .task-groups { grid-template-columns: 1fr 1fr; max-height: none; }
   .stage { min-height: 180px; }
   .tally-row { grid-template-columns: 64px 1fr 120px; }
